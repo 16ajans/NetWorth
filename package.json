@@ -7,6 +7,7 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/app.js",
+    "setup": "node dist/app.js setup",
     "dev": "tsx src/app.ts",
     "clean": "rm -rf dist"
   },
@@ -16,6 +17,7 @@
     "eslint": "^9.39.2",
     "globals": "^16.5.0",
     "jiti": "^2.6.1",
+    "tsx": "^4.19.2",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.50.0"
   }

@@ -1,11 +1,11 @@
-// SimpleFIN TypeScript Client
+// SimpleFIN Net Worth HTTP Server
 // Usage:
-// 1. First time: npm run start <setup-token>
-//    - This will save ACCESS_URL to .env automatically
-// 2. Subsequent runs: npm run start
-//    - Will read ACCESS_URL from .env
+// 1. First time: node dist/server.js setup <setup-token>
+// 2. Start server: node dist/server.js
+// 3. Or with pm2: pm2 start dist/server.js --name networth
 
-import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { createServer, IncomingMessage, ServerResponse } from 'http';
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { join } from 'path';
 
 interface Organization {
@@ -16,16 +16,6 @@ interface Organization {
     id?: string;
 }
 
-interface Transaction {
-    id: string;
-    posted: number;
-    amount: string;
-    description: string;
-    transacted_at?: number;
-    pending?: boolean;
-    extra?: Record<string, unknown>;
-}
-
 interface Account {
     org: Organization;
     id: string;
@@ -34,7 +24,6 @@ interface Account {
     balance: string;
     "available-balance"?: string;
     "balance-date": number;
-    transactions?: Transaction[];
     extra?: Record<string, unknown>;
 }
 
@@ -43,91 +32,68 @@ interface AccountSet {
     accounts: Account[];
 }
 
-interface AccountsOptions {
-    startDate?: number;
-    endDate?: number;
-    pending?: boolean;
-    accountId?: string | string[];
-    balancesOnly?: boolean;
+interface NetWorthCache {
+    netWorth: number;
+    currency: string;
+    lastUpdated: number;
+    accounts: Array<{ name: string; balance: number }>;
+    errors: string[];
+}
+
+interface NetWorthHistoryEntry {
+    timestamp: number;
+    date: string;
+    netWorth: number;
+    currency: string;
+    accountCount: number;
 }
 
 class SimpleFinClient {
-    private accessUrl: string;
     private baseUrl: string;
     private authHeader: string;
 
     constructor(accessUrl: string) {
-        this.accessUrl = accessUrl;
-
-        // Parse URL to extract credentials and base URL
         const url = new URL(accessUrl);
         const username = url.username;
         const password = url.password;
 
-        // Remove credentials from URL
         url.username = '';
         url.password = '';
-        this.baseUrl = url.toString().replace(/\/$/, ''); // Remove trailing slash
+        this.baseUrl = url.toString().replace(/\/$/, '');
 
-        // Create Basic Auth header
         const credentials = Buffer.from(`${username}:${password}`).toString('base64');
         this.authHeader = `Basic ${credentials}`;
     }
 
-    /**
-     * Claim an access URL from a setup token
-     */
     static async claimToken(setupToken: string): Promise<string> {
-        // Decode base64 token to get claim URL
         const claimUrl = Buffer.from(setupToken, "base64").toString("utf-8");
         console.log(`Claiming token from: ${claimUrl.replace(/\/\/.*@/, "//***@")}`);
 
         const response = await fetch(claimUrl, {
             method: "POST",
-            headers: {
-                "Content-Length": "0",
-            },
+            headers: { "Content-Length": "0" },
         });
 
         if (!response.ok) {
             if (response.status === 403) {
-                throw new Error("Token already claimed or invalid. It may have been compromised.");
+                throw new Error(
+                    "Failed to claim token (403 Forbidden). " +
+                    "This token may have already been claimed by someone else, or it has expired. " +
+                    "If you did not claim this token, it may be compromised. " +
+                    "Please generate a new token from SimpleFIN and disable the old one if possible."
+                );
             }
-            throw new Error(`Failed to claim token: ${response.status} ${response.statusText}`);
+            throw new Error(`Failed to claim token: ${response.status}`);
         }
 
-        const accessUrl = await response.text();
-        console.log("✓ Access URL obtained successfully");
-        return accessUrl;
+        return await response.text();
     }
 
-    /**
-     * Fetch accounts and transactions
-     */
-    async fetchAccounts(options: AccountsOptions = {}): Promise<AccountSet> {
-        const url = new URL(`${this.baseUrl}/accounts`);
+    async fetchAccounts(): Promise<AccountSet> {
+        const url = `${this.baseUrl}/accounts?balances-only=1`;
 
-        if (options.startDate) {
-            url.searchParams.set("start-date", options.startDate.toString());
-        }
-        if (options.endDate) {
-            url.searchParams.set("end-date", options.endDate.toString());
-        }
-        if (options.pending) {
-            url.searchParams.set("pending", "1");
-        }
-        if (options.balancesOnly) {
-            url.searchParams.set("balances-only", "1");
-        }
-        if (options.accountId) {
-            const ids = Array.isArray(options.accountId) ? options.accountId : [options.accountId];
-            ids.forEach(id => url.searchParams.append("account", id));
-        }
-
-        const response = await fetch(url.toString(), {
-            headers: {
-                'Authorization': this.authHeader,
-            },
+        const response = await fetch(url, {
+            headers: { 'Authorization': this.authHeader },
         });
 
         if (!response.ok) {
@@ -135,53 +101,317 @@ class SimpleFinClient {
                 throw new Error("Authentication failed. Access may have been revoked.");
             }
             if (response.status === 402) {
-                throw new Error("Payment required to access this data.");
+                throw new Error("Payment required.");
             }
-            throw new Error(`Failed to fetch accounts: ${response.status} ${response.statusText}`);
+            throw new Error(`Failed to fetch accounts: ${response.status}`);
         }
 
-        const data = await response.json() as AccountSet;
+        return await response.json() as AccountSet;
+    }
 
-        // Display any errors to the user
-        if (data.errors && data.errors.length > 0) {
-            console.warn("⚠️  Server errors:");
-            data.errors.forEach(err => console.warn(`   ${err}`));
-        }
+    async calculateNetWorth(): Promise<NetWorthCache> {
+        const data = await this.fetchAccounts();
 
-        return data;
+        let totalNetWorth = 0;
+        const accounts: Array<{ name: string; balance: number }> = [];
+        let currency = "USD";
+
+        data.accounts.forEach(account => {
+            const balance = parseFloat(account.balance);
+
+            if (!account.currency.startsWith('http')) {
+                totalNetWorth += balance;
+                accounts.push({ name: account.name, balance });
+                currency = account.currency;
+            }
+        });
+
+        // Sanitize error messages from SimpleFIN
+        const sanitizedErrors = data.errors.map(err => this.sanitizeErrorMessage(err));
+
+        return {
+            netWorth: totalNetWorth,
+            currency,
+            lastUpdated: Date.now(),
+            accounts,
+            errors: sanitizedErrors,
+        };
     }
 
     /**
-     * Format account balance for display
+     * Sanitize error messages to prevent XSS and injection attacks
+     * Removes HTML tags, limits length, and escapes special characters
      */
-    static formatBalance(account: Account): string {
-        const balance = parseFloat(account.balance);
-        const formatted = new Intl.NumberFormat("en-US", {
+    private sanitizeErrorMessage(message: string): string {
+        // Remove any HTML tags
+        let sanitized = message.replace(/<[^>]*>/g, '');
+
+        // Limit length to prevent excessive data
+        if (sanitized.length > 500) {
+            sanitized = sanitized.substring(0, 500) + '...';
+        }
+
+        // Escape special characters for safe display
+        sanitized = sanitized
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#x27;')
+            .replace(/\//g, '&#x2F;');
+
+        return sanitized;
+    }
+}
+
+class NetWorthServer {
+    private client: SimpleFinClient | null = null;
+    private cache: NetWorthCache | null = null;
+    private refreshInterval: NodeJS.Timeout | null = null;
+    private readonly CACHE_DURATION = 4 * 60 * 60 * 1000; // 4 hours
+    private readonly PORT: number;
+    private readonly HISTORY_FILE: string;
+
+    constructor(port: number = 3000) {
+        this.PORT = port;
+        this.HISTORY_FILE = join(process.cwd(), 'data', 'networth-history.json');
+
+        // Ensure data directory exists
+        const dataDir = join(process.cwd(), 'data');
+        if (!existsSync(dataDir)) {
+            mkdirSync(dataDir, { recursive: true });
+        }
+    }
+
+    async initialize(accessUrl: string) {
+        this.client = new SimpleFinClient(accessUrl);
+
+        // Initial fetch
+        await this.refreshNetWorth();
+
+        // Set up automatic refresh every 4 hours
+        this.refreshInterval = setInterval(() => {
+            this.refreshNetWorth().catch(err => {
+                console.error('Error refreshing net worth:', err.message);
+            });
+        }, this.CACHE_DURATION);
+
+        console.log(`✓ Net worth cache initialized`);
+        console.log(`✓ Auto-refresh enabled (every 4 hours)`);
+    }
+
+    private async refreshNetWorth(): Promise<void> {
+        if (!this.client) {
+            throw new Error('Client not initialized');
+        }
+
+        console.log('Fetching net worth from SimpleFIN...');
+        this.cache = await this.client.calculateNetWorth();
+        console.log(`✓ Net worth updated: ${this.formatCurrency(this.cache.netWorth, this.cache.currency)}`);
+
+        // Log any errors from SimpleFIN to stderr (PM2 will capture)
+        if (this.cache.errors.length > 0) {
+            console.error('⚠️  SimpleFIN warnings:');
+            this.cache.errors.forEach(err => console.error(`   ${err}`));
+        }
+
+        // Save to history
+        this.saveToHistory(this.cache);
+    }
+
+    private saveToHistory(cache: NetWorthCache): void {
+        try {
+            // Read existing history
+            let history: NetWorthHistoryEntry[] = [];
+            if (existsSync(this.HISTORY_FILE)) {
+                const data = readFileSync(this.HISTORY_FILE, 'utf-8');
+                history = JSON.parse(data);
+            }
+
+            // Add new entry
+            const entry: NetWorthHistoryEntry = {
+                timestamp: cache.lastUpdated,
+                date: new Date(cache.lastUpdated).toISOString(),
+                netWorth: cache.netWorth,
+                currency: cache.currency,
+                accountCount: cache.accounts.length,
+            };
+
+            history.push(entry);
+
+            // Write back to file
+            writeFileSync(this.HISTORY_FILE, JSON.stringify(history, null, 2), 'utf-8');
+            console.log(`✓ Net worth logged to history (${history.length} entries total)`);
+        } catch (error) {
+            console.error('Failed to save net worth history:', error);
+        }
+    }
+
+    private formatCurrency(amount: number, currency: string): string {
+        return new Intl.NumberFormat("en-US", {
             style: "currency",
-            currency: account.currency.startsWith("http") ? "USD" : account.currency,
-        }).format(balance);
-
-        if (account["available-balance"]) {
-            const available = parseFloat(account["available-balance"]);
-            const availFormatted = new Intl.NumberFormat("en-US", {
-                style: "currency",
-                currency: account.currency.startsWith("http") ? "USD" : account.currency,
-            }).format(available);
-            return `${formatted} (${availFormatted} available)`;
-        }
-
-        return formatted;
+            currency: currency,
+        }).format(amount);
     }
 
-    /**
-     * Format transaction for display
-     */
-    static formatTransaction(tx: Transaction): string {
-        const date = new Date(tx.posted * 1000).toLocaleDateString();
-        const amount = parseFloat(tx.amount);
-        const sign = amount >= 0 ? "+" : "";
-        const pending = tx.pending ? " [PENDING]" : "";
-        return `${date}: ${sign}$${amount.toFixed(2)} - ${tx.description}${pending}`;
+    private handleRequest(req: IncomingMessage, res: ServerResponse): void {
+        const url = req.url || '/';
+
+        // Health check endpoint
+        if (url === '/health') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'ok' }));
+            return;
+        }
+
+        // Net worth endpoint - returns raw number as plain text
+        if (url === '/networth' || url === '/') {
+            if (!this.cache) {
+                res.writeHead(503, { 'Content-Type': 'text/plain' });
+                res.end('Service unavailable');
+                return;
+            }
+
+            res.writeHead(200, { 'Content-Type': 'text/plain' });
+            res.end(this.cache.netWorth.toFixed(2));
+            return;
+        }
+
+        // 30-day change endpoint - returns change as plain text
+        if (url === '/networth/change' || url === '/change') {
+            const change = this.calculateChange30Days();
+
+            if (change === null) {
+                res.writeHead(503, { 'Content-Type': 'text/plain' });
+                res.end('Insufficient data');
+                return;
+            }
+
+            res.writeHead(200, { 'Content-Type': 'text/plain' });
+            res.end(change.toFixed(2));
+            return;
+        }
+
+        // Detailed endpoint with JSON
+        if (url === '/networth/details') {
+            if (!this.cache) {
+                res.writeHead(503, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Net worth data not available yet' }));
+                return;
+            }
+
+            const change30d = this.calculateChange30Days();
+
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                netWorth: this.cache.netWorth,
+                currency: this.cache.currency,
+                formatted: this.formatCurrency(this.cache.netWorth, this.cache.currency),
+                lastUpdated: new Date(this.cache.lastUpdated).toISOString(),
+                accountCount: this.cache.accounts.length,
+                change30Days: change30d,
+                change30DaysFormatted: change30d !== null ? this.formatCurrency(change30d, this.cache.currency) : null,
+            }));
+            return;
+        }
+
+        // 404
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        res.end('Not found');
+    }
+
+    private calculateChange30Days(): number | null {
+        if (!this.cache) return null;
+
+        try {
+            // Read history
+            if (!existsSync(this.HISTORY_FILE)) {
+                return null;
+            }
+
+            const data = readFileSync(this.HISTORY_FILE, 'utf-8');
+            const history: NetWorthHistoryEntry[] = JSON.parse(data);
+
+            if (history.length === 0) {
+                return null;
+            }
+
+            // Find entry closest to 30 days ago
+            const thirtyDaysAgo = Date.now() - (30 * 24 * 60 * 60 * 1000);
+
+            // Filter entries that are at least 30 days old
+            const oldEntries = history.filter(entry => entry.timestamp <= thirtyDaysAgo);
+
+            if (oldEntries.length === 0) {
+                // Not enough data yet
+                return null;
+            }
+
+            // Get the most recent entry from 30+ days ago
+            const oldEntry = oldEntries[oldEntries.length - 1];
+
+            if (!oldEntry) {
+                return null;
+            }
+
+            // Calculate change
+            const change = this.cache.netWorth - oldEntry.netWorth;
+            return change;
+
+        } catch (error) {
+            console.error('Error calculating 30-day change:', error);
+            return null;
+        }
+    }
+
+    start(): void {
+        const server = createServer((req, res) => {
+            // CORS headers for reverse proxy compatibility
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+            res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+            if (req.method === 'OPTIONS') {
+                res.writeHead(204);
+                res.end();
+                return;
+            }
+
+            this.handleRequest(req, res);
+        });
+
+        server.listen(this.PORT, () => {
+            console.log(`\n${"=".repeat(60)}`);
+            console.log(`Net Worth Server Running`);
+            console.log("=".repeat(60));
+            console.log(`\n  Endpoints:`);
+            console.log(`    http://localhost:${this.PORT}/              - Raw net worth (text)`);
+            console.log(`    http://localhost:${this.PORT}/networth      - Raw net worth (text)`);
+            console.log(`    http://localhost:${this.PORT}/change        - 30-day change (text)`);
+            console.log(`    http://localhost:${this.PORT}/networth/details - JSON with metadata`);
+            console.log(`    http://localhost:${this.PORT}/health        - Health check`);
+            console.log(`\n  Cache refresh: Every 4 hours`);
+            console.log(`  Last updated: ${this.cache ? new Date(this.cache.lastUpdated).toLocaleString() : 'Not yet fetched'}`);
+            console.log(`\n${"=".repeat(60)}\n`);
+        });
+
+        // Graceful shutdown
+        process.on('SIGINT', () => {
+            console.log('\nShutting down gracefully...');
+            if (this.refreshInterval) {
+                clearInterval(this.refreshInterval);
+            }
+            server.close(() => {
+                console.log('Server closed');
+                process.exit(0);
+            });
+        });
+    }
+
+    stop(): void {
+        if (this.refreshInterval) {
+            clearInterval(this.refreshInterval);
+        }
     }
 }
 
@@ -190,145 +420,59 @@ async function main() {
     const args = process.argv.slice(2);
     const envPath = join(process.cwd(), '.env');
 
+    // Setup mode
+    if (args[0] === 'setup') {
+        if (!args[1]) {
+            console.error('Usage: node dist/server.js setup <setup-token>');
+            process.exit(1);
+        }
+
+        console.log('Setting up SimpleFIN access...');
+        const accessUrl = await SimpleFinClient.claimToken(args[1]);
+        console.log('✓ Access URL obtained');
+
+        let envContent = '';
+        if (existsSync(envPath)) {
+            envContent = readFileSync(envPath, 'utf-8');
+            envContent = envContent.replace(/ACCESS_URL=.+\n?/g, '');
+        }
+
+        envContent += `ACCESS_URL=${accessUrl}\n`;
+        writeFileSync(envPath, envContent, 'utf-8');
+        console.log('✓ Saved to .env file');
+        console.log('\nNow start the server with: node dist/server.js');
+        return;
+    }
+
+    // Server mode
     let accessUrl: string | undefined;
 
-    // Try to read from .env first
     if (existsSync(envPath)) {
-        try {
-            const envContent = readFileSync(envPath, 'utf-8');
-            const match = envContent.match(/ACCESS_URL=(.+)/);
-            if (match?.[1]) {
-                accessUrl = match[1].trim();
-                console.log("✓ Found ACCESS_URL in .env file");
-            }
-        } catch (error) {
-            console.warn("Warning: Could not read .env file", error);
-        }
-    }
-
-    // If no access URL in .env and no token provided, show usage
-    if (!accessUrl && args.length === 0) {
-        console.log("SimpleFIN Client");
-        console.log("\nUsage:");
-        console.log("  First time setup:");
-        console.log("    npm run start <setup-token>");
-        console.log("    (This will save ACCESS_URL to .env automatically)");
-        console.log("\n  Subsequent runs:");
-        console.log("    npm run start");
-        console.log("    (Reads ACCESS_URL from .env)");
-        console.log("\nGet a setup token from: https://beta-bridge.simplefin.org/simplefin/create");
-        process.exit(1);
-    }
-
-    // If token provided, claim it and save to .env
-    if (args[0] && !accessUrl) {
-        console.log("Claiming setup token...");
-        accessUrl = await SimpleFinClient.claimToken(args[0]);
-        console.log("✓ Access URL obtained successfully");
-
-        // Save to .env
-        try {
-            let envContent = '';
-            if (existsSync(envPath)) {
-                envContent = readFileSync(envPath, 'utf-8');
-                // Remove existing ACCESS_URL if present
-                envContent = envContent.replace(/ACCESS_URL=.+\n?/g, '');
-            }
-
-            // Add new ACCESS_URL
-            envContent += `ACCESS_URL=${accessUrl}\n`;
-            writeFileSync(envPath, envContent, 'utf-8');
-            console.log("✓ Access URL saved to .env file");
-            console.log("\n⚠️  IMPORTANT: Keep your .env file secure and never commit it to version control!");
-        } catch (error) {
-            console.error("Error saving to .env:", error);
-            console.log("\n⚠️  IMPORTANT: Save this access URL securely!");
-            console.log(`Access URL: ${accessUrl}`);
+        const envContent = readFileSync(envPath, 'utf-8');
+        const match = envContent.match(/ACCESS_URL=(.+)/);
+        if (match?.[1]) {
+            accessUrl = match[1].trim();
         }
     }
 
     if (!accessUrl) {
-        console.error("No access URL available");
+        console.error('No ACCESS_URL found in .env file');
+        console.error('\nRun setup first: node dist/server.js setup <setup-token>');
+        console.error('Get a token from: https://beta-bridge.simplefin.org/simplefin/create');
         process.exit(1);
     }
 
-    // Create client and fetch data
-    const client = new SimpleFinClient(accessUrl);
+    const port = parseInt(process.env.PORT || '3000');
+    const server = new NetWorthServer(port);
 
-    console.log("\nFetching account data...");
-    const data = await client.fetchAccounts({
-        balancesOnly: true, // We only need balances for net worth
-    });
-
-    // Calculate net worth
-    let totalNetWorth = 0;
-    const accountBalances: Array<{ name: string; balance: number; currency: string }> = [];
-
-    data.accounts.forEach(account => {
-        const balance = parseFloat(account.balance);
-
-        // Only include standard currencies (skip custom currencies like reward points)
-        if (!account.currency.startsWith('http')) {
-            // TODO: For multi-currency support, you'd want to convert to a base currency
-            // For now, we assume all accounts are in the same currency
-            totalNetWorth += balance;
-            accountBalances.push({
-                name: account.name,
-                balance: balance,
-                currency: account.currency,
-            });
-        }
-    });
-
-    // Display results
-    console.log(`\n${"=".repeat(60)}`);
-    console.log("NET WORTH SUMMARY");
-    console.log("=".repeat(60));
-
-    if (accountBalances.length === 0) {
-        console.log("\nNo accounts found.");
-    } else {
-        // Find the longest account name for proper alignment
-        const maxNameLength = Math.max(...accountBalances.map(a => a.name.length));
-        const nameColumnWidth = Math.max(maxNameLength, 20); // Minimum 20 chars
-
-        console.log(`\nAccounts (${accountBalances.length}):\n`);
-
-        accountBalances.forEach(account => {
-            const formatted = new Intl.NumberFormat("en-US", {
-                style: "currency",
-                currency: account.currency,
-                signDisplay: "always",
-            }).format(account.balance);
-
-            console.log(`  ${account.name.padEnd(nameColumnWidth)} ${formatted.padStart(15)}`);
-        });
-
-        console.log(`\n${"-".repeat(nameColumnWidth + 17)}`);
-
-        // Assuming all accounts are in the same currency for simplicity
-        const currency = accountBalances[0]?.currency || "USD";
-        const netWorthFormatted = new Intl.NumberFormat("en-US", {
-            style: "currency",
-            currency: currency,
-        }).format(totalNetWorth);
-
-        console.log(`  ${"TOTAL NET WORTH".padEnd(nameColumnWidth)} ${netWorthFormatted.padStart(15)}`);
-    }
-
-    console.log(`\n${"=".repeat(60)}\n`);
+    await server.initialize(accessUrl);
+    server.start();
 }
 
-// Run if this is the main module
-import { fileURLToPath } from "url";
-const isMain = process.argv[1] === fileURLToPath(import.meta.url);
+// Run
+main().catch(error => {
+    console.error('Error:', error.message);
+    process.exit(1);
+});
 
-if (isMain) {
-    main().catch(error => {
-        console.error("Error:", error.message);
-        process.exit(1);
-    });
-}
-
-export { SimpleFinClient };
-export type { Account, Transaction, AccountSet, AccountsOptions, Organization };
+export { SimpleFinClient, NetWorthServer };

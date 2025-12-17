@@ -9,6 +9,12 @@ dist/
 .env.local
 .env.*.local
 
+# Data directory (contains net worth history - optional to track in git)
+data/
+
+# PM2 logs
+logs/
+
 # Editor files
 .vscode/
 .idea/
